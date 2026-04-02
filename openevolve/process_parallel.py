@@ -182,13 +182,37 @@ def _run_iteration_worker(
         # Build extra kwargs for hypothesis-driven evolution
         extra_prompt_kwargs = {}
         if getattr(_worker_config, "hypothesis_driven", False):
-            knowledge_entries = db_snapshot.get("knowledge_entries", [])
-            if knowledge_entries:
+            all_knowledge = db_snapshot.get("knowledge_entries", {})
+
+            # Primary: this island's full knowledge history
+            island_entries = all_knowledge.get(str(parent_island), [])
+
+            # Secondary: confirmed hypotheses from other islands (cross-pollination)
+            cross_island = []
+            for isl, entries in all_knowledge.items():
+                if int(isl) != parent_island:
+                    cross_island.extend(
+                        e for e in entries if e[1] == "CONFIRMED" and e[2] > 0.01
+                    )
+
+            # Filter noise: remove entries with |delta| < 0.005, keep ERRORs always
+            island_entries = [
+                e for e in island_entries
+                if abs(e[2]) > 0.005 or "ERROR" in str(e[1])
+            ]
+
+            display_entries = island_entries + cross_island
+            island_entry_set = set(tuple(e) for e in island_entries)
+
+            if display_entries:
                 kb_lines = ["# Knowledge Base (Past Hypotheses)"]
-                for hyp, outcome, delta, it in knowledge_entries[-15:]:
+                for hyp, outcome, delta, it in display_entries:
                     sign = "+" if delta > 0 else ""
+                    source = ""
+                    if tuple([hyp, outcome, delta, it]) not in island_entry_set:
+                        source = " [other island]"
                     kb_lines.append(
-                        f"- [{outcome} {sign}{delta:.4f}] \"{hyp}\" (iter {it})"
+                        f"- [{outcome} {sign}{delta:.4f}] \"{hyp}\" (iter {it}){source}"
                     )
                 extra_prompt_kwargs["knowledge_base_summary"] = "\n".join(kb_lines)
             else:
@@ -392,8 +416,10 @@ class ProcessParallelController:
         self.num_workers = config.evaluator.parallel_evaluations
         self.num_islands = config.database.num_islands
 
-        # Hypothesis-driven evolution: accumulated knowledge from past iterations
-        self.knowledge_entries: list = []  # [(hypothesis, outcome, score_delta, iteration)]
+        # Hypothesis-driven evolution: per-island knowledge from past iterations
+        self.knowledge_entries: dict = {
+            i: [] for i in range(self.num_islands)
+        }  # {island_id: [(hypothesis, outcome, score_delta, iteration)]}
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
 
@@ -506,9 +532,11 @@ class ProcessParallelController:
             if artifacts:
                 snapshot["artifacts"][pid] = artifacts
 
-        # Include recent knowledge entries for hypothesis-driven evolution
+        # Include per-island knowledge entries for hypothesis-driven evolution
         if self.config.hypothesis_driven:
-            snapshot["knowledge_entries"] = self.knowledge_entries[-20:]
+            snapshot["knowledge_entries"] = {
+                str(k): v[-20:] for k, v in self.knowledge_entries.items()
+            }
 
         return snapshot
 
@@ -719,6 +747,25 @@ class ProcessParallelController:
                         self.database.log_island_status()
                         if checkpoint_callback:
                             checkpoint_callback(completed_iteration)
+                        # Log knowledge base state for analysis
+                        if self.config.hypothesis_driven:
+                            total_kb = sum(len(v) for v in self.knowledge_entries.values())
+                            confirmed = sum(
+                                1 for v in self.knowledge_entries.values()
+                                for e in v if e[1] == "CONFIRMED"
+                            )
+                            refuted = sum(
+                                1 for v in self.knowledge_entries.values()
+                                for e in v if "REFUTED" in str(e[1])
+                            )
+                            errors = sum(
+                                1 for v in self.knowledge_entries.values()
+                                for e in v if "ERROR" in str(e[1])
+                            )
+                            logger.info(
+                                f"Knowledge base: {total_kb} entries "
+                                f"({confirmed} confirmed, {refuted} refuted, {errors} errors)"
+                            )
 
                     # Check target score
                     if target_score is not None and child_program.metrics:
@@ -787,7 +834,11 @@ class ProcessParallelController:
                                     self.early_stopping_triggered = True
                                     break
 
-                # Record hypothesis outcome for knowledge accumulation
+                # Record hypothesis outcome for knowledge accumulation (per-island)
+                h_island = result.target_island if result.target_island is not None else 0
+                if h_island not in self.knowledge_entries:
+                    self.knowledge_entries[h_island] = []
+
                 if hasattr(result, "hypothesis") and result.hypothesis:
                     if result.error:
                         h_outcome = "ERROR"
@@ -804,7 +855,6 @@ class ProcessParallelController:
                         if h_delta > 0.001:
                             h_outcome = "CONFIRMED"
                         else:
-                            # Include the specific error reason if the evaluator reported one
                             metrics_error = result.child_program_dict.get(
                                 "metrics", {}
                             ).get("error", "")
@@ -815,26 +865,25 @@ class ProcessParallelController:
                     else:
                         h_outcome = "REFUTED"
                         h_delta = 0.0
-                    self.knowledge_entries.append(
+                    self.knowledge_entries[h_island].append(
                         (result.hypothesis, h_outcome, h_delta, completed_iteration)
                     )
                 elif self.config.hypothesis_driven and not (
                     hasattr(result, "hypothesis") and result.hypothesis
                 ):
-                    # No hypothesis extracted -- record errors so the LLM sees them
                     if result.child_program_dict:
                         metrics_error = result.child_program_dict.get(
                             "metrics", {}
                         ).get("error", "")
                         if metrics_error:
-                            self.knowledge_entries.append(
+                            self.knowledge_entries[h_island].append(
                                 (f"[Evaluation failed: {metrics_error}]", "ERROR", 0.0, completed_iteration)
                             )
                     elif result.error:
                         error_msg = result.error
                         if "timeout" in error_msg.lower():
                             error_msg = "Program timed out -- too many optimization iterations"
-                        self.knowledge_entries.append(
+                        self.knowledge_entries[h_island].append(
                             (f"[Error: {error_msg}]", "ERROR", 0.0, completed_iteration)
                         )
 
