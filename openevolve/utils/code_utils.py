@@ -136,6 +136,20 @@ def extract_hypothesis(llm_response: str) -> Optional[str]:
     return None
 
 
+def parse_critique_response(response: str) -> Tuple[Optional[str], int]:
+    """Extract hypothesis and self-rating from a critique response.
+
+    Expected format:
+        Hypothesis: [text]
+        Rating: [1-5]
+        Reasoning: [text]
+    """
+    hypothesis = extract_hypothesis(response)
+    rating_match = re.search(r"Rating:\s*(\d)", response)
+    rating = int(rating_match.group(1)) if rating_match else 0
+    return hypothesis, min(rating, 5)
+
+
 def _format_block_lines(lines: List[str], max_line_len: int = 100, max_lines: int = 30) -> str:
     """Format a block of lines for diff summary: show all lines (truncated per line, optional cap)."""
     truncated = []

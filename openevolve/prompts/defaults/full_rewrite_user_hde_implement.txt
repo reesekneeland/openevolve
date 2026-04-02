@@ -1,0 +1,30 @@
+# Current Program Information
+- Fitness: {fitness_score}
+- Feature coordinates: {feature_coords}
+
+{artifacts}
+
+# Current Program
+```{language}
+{current_program}
+```
+
+# Task
+Implement the following vetted hypothesis by rewriting the program:
+
+Hypothesis: {vetted_hypothesis}
+
+Write the complete rewritten program that tests this hypothesis.
+The system maintains diversity across these dimensions: {feature_dimensions}
+
+CONSTRAINTS (violating these results in score=0):
+- Must return exactly 26 circles: centers shape (26, 2), radii shape (26,)
+- All circles must stay within the unit square [0,1]x[0,1]
+- No circles may overlap
+- The function must be named construct_packing() and return (centers, radii, sum_radii)
+- You MUST include a run_packing() function that calls construct_packing() and returns its result
+- Do not use any unicode characters in your code. Use only ASCII quotes and symbols.
+
+```{language}
+# Your rewritten program here
+```

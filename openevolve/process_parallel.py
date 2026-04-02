@@ -244,20 +244,112 @@ def _run_iteration_worker(
 
         iteration_start = time.time()
 
-        # Generate code modification (sync wrapper for async)
-        try:
-            llm_response = asyncio.run(
-                _worker_llm_ensemble.generate_with_context(
-                    system_message=prompt["system"],
-                    messages=[{"role": "user", "content": prompt["user"]}],
-                )
+        # GAN-style hypothesis critique: two-call flow
+        hypothesis_text = None
+        token_usage = None
+
+        if getattr(_worker_config, "hypothesis_critique", False):
+            from openevolve.utils.code_utils import extract_hypothesis, parse_critique_response
+
+            # Call 1: Generate + self-critique hypothesis (up to 3 attempts)
+            critique_template = _worker_prompt_sampler.template_manager.get_template(
+                "full_rewrite_user_hde_critique"
             )
-        except Exception as e:
-            logger.error(f"LLM generation failed: {e}")
-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+            critique_prompt_text = critique_template.format(
+                fitness_score=f"{parent.metrics.get('combined_score', 0):.4f}",
+                feature_coords="",
+                improvement_areas="Improve fitness score",
+                evolution_history="",
+                current_program=parent.code,
+                language=_worker_config.language,
+                **extra_prompt_kwargs,
+            )
+
+            best_hypothesis = None
+            best_rating = 0
+            critique_attempts = 0
+
+            for attempt in range(3):
+                critique_attempts += 1
+                try:
+                    critique_response = asyncio.run(
+                        _worker_llm_ensemble.generate_with_context(
+                            system_message=prompt["system"],
+                            messages=[{"role": "user", "content": critique_prompt_text}],
+                            max_tokens=300,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Critique call {attempt+1} failed: {e}")
+                    continue
+
+                hyp, rating = parse_critique_response(critique_response or "")
+                logger.info(f"Critique attempt {attempt+1}: rating={rating}, hypothesis={hyp[:80] if hyp else 'None'}")
+
+                if hyp and rating > best_rating:
+                    best_hypothesis = hyp
+                    best_rating = rating
+                if rating >= 3:
+                    break
+
+            if not best_hypothesis:
+                return SerializableResult(
+                    error=f"All {critique_attempts} critique attempts failed to produce a hypothesis",
+                    iteration=iteration,
+                )
+
+            hypothesis_text = best_hypothesis
+            logger.info(f"Vetted hypothesis (rating={best_rating}): {hypothesis_text[:100]}")
+
+            # Call 2: Implement the vetted hypothesis
+            impl_template = _worker_prompt_sampler.template_manager.get_template(
+                "full_rewrite_user_hde_implement"
+            )
+            impl_prompt_text = impl_template.format(
+                fitness_score=f"{parent.metrics.get('combined_score', 0):.4f}",
+                feature_coords="",
+                current_program=parent.code,
+                language=_worker_config.language,
+                feature_dimensions=", ".join(db_snapshot.get("feature_dimensions", [])),
+                vetted_hypothesis=best_hypothesis,
+                artifacts="",
+            )
+
+            try:
+                llm_response = asyncio.run(
+                    _worker_llm_ensemble.generate_with_context(
+                        system_message=prompt["system"],
+                        messages=[{"role": "user", "content": impl_prompt_text}],
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Implementation call failed: {e}")
+                return SerializableResult(
+                    error=f"Implementation call failed: {str(e)}",
+                    iteration=iteration,
+                    hypothesis=hypothesis_text,
+                )
+
+        else:
+            # Standard single-call flow (existing behavior)
+            try:
+                llm_response = asyncio.run(
+                    _worker_llm_ensemble.generate_with_context(
+                        system_message=prompt["system"],
+                        messages=[{"role": "user", "content": prompt["user"]}],
+                    )
+                )
+            except Exception as e:
+                logger.error(f"LLM generation failed: {e}")
+                return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+
+            # Extract hypothesis from structured response (single-call HDE)
+            if getattr(_worker_config, "hypothesis_driven", False):
+                from openevolve.utils.code_utils import extract_hypothesis
+
+                hypothesis_text = extract_hypothesis(llm_response)
 
         # Capture token usage from the LLM that was just called
-        token_usage = None
         for m in _worker_llm_ensemble.models:
             if hasattr(m, "last_usage") and m.last_usage is not None:
                 token_usage = m.last_usage
@@ -266,13 +358,6 @@ def _run_iteration_worker(
         # Check for None response
         if llm_response is None:
             return SerializableResult(error="LLM returned None response", iteration=iteration)
-
-        # Extract hypothesis from structured response (hypothesis-driven evolution)
-        hypothesis_text = None
-        if getattr(_worker_config, "hypothesis_driven", False):
-            from openevolve.utils.code_utils import extract_hypothesis
-
-            hypothesis_text = extract_hypothesis(llm_response)
 
         # Parse response based on evolution mode
         if _worker_config.diff_based_evolution:
@@ -463,6 +548,7 @@ class ProcessParallelController:
             "diff_based_evolution": config.diff_based_evolution,
             "max_code_length": config.max_code_length,
             "hypothesis_driven": config.hypothesis_driven,
+            "hypothesis_critique": config.hypothesis_critique,
             "language": config.language,
             "file_suffix": self.file_suffix,
         }
