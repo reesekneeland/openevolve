@@ -36,6 +36,7 @@ class SerializableResult:
     target_island: Optional[int] = None  # Island where child should be placed
     hypothesis: Optional[str] = None  # Extracted hypothesis from LLM response
     token_usage: Optional[Dict[str, int]] = None  # Token counts from LLM call
+    bandit_arm: Optional[str] = None  # Which bandit strategy arm was used
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -150,6 +151,9 @@ def _run_iteration_worker(
         # Get parent artifacts if available
         parent_artifacts = db_snapshot["artifacts"].get(parent_id)
 
+        # Get bandit arm for this iteration (may be None)
+        bandit_arm = db_snapshot.get("bandit_arm")
+
         # Get island-specific programs for context
         parent_island = parent.metadata.get("island", db_snapshot["current_island"])
         island_programs = [
@@ -218,6 +222,42 @@ def _run_iteration_worker(
                 extra_prompt_kwargs["knowledge_base_summary"] = "\n".join(kb_lines)
             else:
                 extra_prompt_kwargs["knowledge_base_summary"] = ""
+
+        # Population summary (HDE v2)
+        if getattr(_worker_config, "hypothesis_driven", False):
+            extra_prompt_kwargs["population_summary"] = db_snapshot.get(
+                "population_summary", ""
+            )
+
+        # Score decomposition breakdown for parent program (HDE v2)
+        if getattr(_worker_config, "hypothesis_driven", False) and parent.metrics:
+            sub_keys = [
+                "boundary_utilization", "interior_density",
+                "worst_gap_size", "mean_radius", "radius_cv",
+            ]
+            sub_lines = []
+            for k in sub_keys:
+                v = parent.metrics.get(k)
+                if v is not None:
+                    label = k.replace("_", " ").title()
+                    sub_lines.append(f"  {label}: {v:.4f}")
+            extra_prompt_kwargs["score_breakdown"] = "\n".join(sub_lines) if sub_lines else ""
+
+        # Bandit strategy instruction (HDE v2)
+        bandit_arm = db_snapshot.get("bandit_arm")
+        STRATEGY_INSTRUCTIONS = {
+            "explore": "Try a FUNDAMENTALLY DIFFERENT algorithmic approach from the current program. Do not refine -- reinvent.",
+            "refine": "Make TARGETED improvements to the current program. Keep the overall structure but optimize parameters, tighten loops, or improve numerical precision.",
+            "combine": "Look at the inspiration programs and COMBINE the strongest elements from different approaches into one program.",
+            "diagnose": "The current program has specific weaknesses shown in the score breakdown. DIAGNOSE the bottleneck and fix it.",
+            "target": "Focus on improving the WEAKEST sub-metric shown in the score breakdown. Ignore other aspects.",
+        }
+        if bandit_arm and bandit_arm in STRATEGY_INSTRUCTIONS:
+            extra_prompt_kwargs["strategy_instruction"] = (
+                f"**Strategy: {bandit_arm.upper()}** -- {STRATEGY_INSTRUCTIONS[bandit_arm]}"
+            )
+        else:
+            extra_prompt_kwargs["strategy_instruction"] = ""
 
         # Select template override for HDE mode
         template_key = None
@@ -393,6 +433,7 @@ def _run_iteration_worker(
             target_island=target_island,
             hypothesis=hypothesis_text,
             token_usage=token_usage,
+            bandit_arm=bandit_arm,
         )
 
     except Exception as e:
@@ -430,6 +471,11 @@ class ProcessParallelController:
             i: [] for i in range(self.num_islands)
         }  # {island_id: [(hypothesis, outcome, score_delta, iteration)]}
 
+        # Adaptive strategy bandit (UCB1)
+        self.bandit_arms = ["explore", "refine", "combine", "diagnose", "target"]
+        self.bandit_counts = {arm: 0 for arm in self.bandit_arms}
+        self.bandit_rewards = {arm: 0.0 for arm in self.bandit_arms}
+
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
 
     def _serialize_config(self, config: Config) -> dict:
@@ -463,6 +509,7 @@ class ProcessParallelController:
             "diff_based_evolution": config.diff_based_evolution,
             "max_code_length": config.max_code_length,
             "hypothesis_driven": config.hypothesis_driven,
+            "bandit_enabled": config.bandit_enabled,
             "language": config.language,
             "file_suffix": self.file_suffix,
         }
@@ -513,6 +560,57 @@ class ProcessParallelController:
         logger.info("Graceful shutdown requested...")
         self.shutdown_event.set()
 
+    def _select_bandit_arm(self) -> str:
+        """Select a strategy arm using UCB1."""
+        import math
+
+        total = sum(self.bandit_counts.values())
+
+        # First: try each arm once
+        for arm in self.bandit_arms:
+            if self.bandit_counts[arm] == 0:
+                return arm
+
+        # UCB1 selection
+        best_arm = self.bandit_arms[0]
+        best_ucb = -float("inf")
+        for arm in self.bandit_arms:
+            n = self.bandit_counts[arm]
+            avg_reward = self.bandit_rewards[arm] / n
+            ucb = avg_reward + math.sqrt(2 * math.log(total) / n)
+            if ucb > best_ucb:
+                best_ucb = ucb
+                best_arm = arm
+        return best_arm
+
+    def _update_bandit(self, arm: str, reward: float) -> None:
+        """Update bandit statistics after observing a reward."""
+        self.bandit_counts[arm] += 1
+        self.bandit_rewards[arm] += reward
+
+    def _format_population_summary(self) -> str:
+        """Format island stats into a population landscape summary."""
+        stats = self.database.get_island_stats()
+        total_programs = sum(s.get("num_programs", 0) for s in stats)
+        best_overall = max(
+            (s.get("best_score", 0) for s in stats), default=0
+        )
+
+        lines = [
+            f"# Population Landscape ({total_programs} programs across {len(stats)} islands, best: {best_overall:.4f})"
+        ]
+        for s in stats:
+            idx = s.get("island_id", "?")
+            n = s.get("num_programs", 0)
+            best = s.get("best_score", 0)
+            avg = s.get("avg_score", 0)
+            div = s.get("diversity", 0)
+            marker = " *" if s.get("is_current", False) else ""
+            lines.append(
+                f"  Island {idx}: {n} programs, best={best:.4f}, avg={avg:.4f}, diversity={div:.0f}{marker}"
+            )
+        return "\n".join(lines)
+
     def _create_database_snapshot(self) -> Dict[str, Any]:
         """Create a serializable snapshot of the database state"""
         # Only include necessary data for workers
@@ -546,6 +644,17 @@ class ProcessParallelController:
             snapshot["knowledge_entries"] = {
                 str(k): v[-20:] for k, v in self.knowledge_entries.items()
             }
+
+        # Include population summary for HDE v2
+        if self.config.hypothesis_driven:
+            snapshot["population_summary"] = self._format_population_summary()
+
+        # Include bandit-selected strategy for HDE v2
+        if self.config.bandit_enabled:
+            arm = self._select_bandit_arm()
+            snapshot["bandit_arm"] = arm
+        else:
+            snapshot["bandit_arm"] = None
 
         return snapshot
 
@@ -895,6 +1004,19 @@ class ProcessParallelController:
                         self.knowledge_entries[h_island].append(
                             (f"[Error: {error_msg}]", "ERROR", 0.0, completed_iteration)
                         )
+
+                # Update bandit with reward from this iteration
+                if self.config.bandit_enabled and hasattr(result, "bandit_arm") and result.bandit_arm:
+                    if result.error:
+                        reward = -0.1  # Small penalty for errors
+                    elif result.child_program_dict:
+                        child_score = result.child_program_dict.get("metrics", {}).get("combined_score", 0)
+                        parent_prog = self.database.programs.get(result.parent_id)
+                        parent_score = parent_prog.metrics.get("combined_score", 0) if parent_prog else 0
+                        reward = max(child_score - parent_score, 0.0)  # Only positive rewards
+                    else:
+                        reward = 0.0
+                    self._update_bandit(result.bandit_arm, reward)
 
             except FutureTimeoutError:
                 logger.error(

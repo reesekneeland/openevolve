@@ -5,6 +5,10 @@
 
 {artifacts}
 
+{score_breakdown}
+
+{population_summary}
+
 {knowledge_base_summary}
 
 # Program Evolution History
@@ -16,9 +20,11 @@
 ```
 
 # Task
+{strategy_instruction}
+
 You are a scientist improving this program through hypothesis-driven experimentation.
 
-1. ANALYZE the current program and the knowledge base above (if any).
+1. ANALYZE the current program, the score breakdown, and the population landscape above.
 2. State your hypothesis on a single line starting with "Hypothesis:" followed by one specific, testable claim about what change will improve the fitness score and why.
 3. IMPLEMENT the complete rewritten program that tests your hypothesis.
 
