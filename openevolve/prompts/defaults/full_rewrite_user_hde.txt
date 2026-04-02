@@ -23,7 +23,7 @@ You are a scientist improving this program through hypothesis-driven experimenta
 3. IMPLEMENT the complete rewritten program that tests your hypothesis.
 
 Your hypothesis should be specific enough that the result confirms or refutes it.
-Do NOT repeat approaches that were already refuted in the knowledge base.
+The knowledge base shows what has been tried. Avoid repeating approaches that produced errors. Refuted approaches may work with a different implementation -- use your judgment.
 The system maintains diversity across these dimensions: {feature_dimensions}
 
 CONSTRAINTS (violating these results in score=0):
