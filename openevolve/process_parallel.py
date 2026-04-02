@@ -34,6 +34,7 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
+    hypothesis: Optional[str] = None  # Extracted hypothesis from LLM response
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -178,6 +179,27 @@ def _run_iteration_worker(
             parent_changes_desc = None
             child_changes_desc = None
 
+        # Build extra kwargs for hypothesis-driven evolution
+        extra_prompt_kwargs = {}
+        if getattr(_worker_config, "hypothesis_driven", False):
+            knowledge_entries = db_snapshot.get("knowledge_entries", [])
+            if knowledge_entries:
+                kb_lines = ["# Knowledge Base (Past Hypotheses)"]
+                for hyp, outcome, delta, it in knowledge_entries[-15:]:
+                    sign = "+" if delta > 0 else ""
+                    kb_lines.append(
+                        f"- [{outcome} {sign}{delta:.4f}] \"{hyp}\" (iter {it})"
+                    )
+                extra_prompt_kwargs["knowledge_base_summary"] = "\n".join(kb_lines)
+            else:
+                extra_prompt_kwargs["knowledge_base_summary"] = ""
+
+        # Select template override for HDE mode
+        template_key = None
+        if getattr(_worker_config, "hypothesis_driven", False):
+            if not _worker_config.diff_based_evolution:
+                template_key = "full_rewrite_user_hde"
+
         prompt = _worker_prompt_sampler.build_prompt(
             current_program=parent.code,
             parent_program=parent.code,
@@ -188,9 +210,11 @@ def _run_iteration_worker(
             language=_worker_config.language,
             evolution_round=iteration,
             diff_based_evolution=_worker_config.diff_based_evolution,
+            template_key=template_key,
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
             current_changes_description=parent_changes_desc,
+            **extra_prompt_kwargs,
         )
 
         iteration_start = time.time()
@@ -210,6 +234,13 @@ def _run_iteration_worker(
         # Check for None response
         if llm_response is None:
             return SerializableResult(error="LLM returned None response", iteration=iteration)
+
+        # Extract hypothesis from structured response (hypothesis-driven evolution)
+        hypothesis_text = None
+        if getattr(_worker_config, "hypothesis_driven", False):
+            from openevolve.utils.code_utils import extract_hypothesis
+
+            hypothesis_text = extract_hypothesis(llm_response)
 
         # Parse response based on evolution mode
         if _worker_config.diff_based_evolution:
@@ -272,7 +303,9 @@ def _run_iteration_worker(
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
                 return SerializableResult(
-                    error=f"No valid code found in response", iteration=iteration
+                    error=f"No valid code found in response",
+                    iteration=iteration,
+                    hypothesis=hypothesis_text,
                 )
 
             child_code = new_code
@@ -283,6 +316,7 @@ def _run_iteration_worker(
             return SerializableResult(
                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
                 iteration=iteration,
+                hypothesis=hypothesis_text,
             )
 
         # Evaluate the child program
@@ -325,6 +359,7 @@ def _run_iteration_worker(
             artifacts=artifacts,
             iteration=iteration,
             target_island=target_island,
+            hypothesis=hypothesis_text,
         )
 
     except Exception as e:
@@ -356,6 +391,9 @@ class ProcessParallelController:
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
         self.num_islands = config.database.num_islands
+
+        # Hypothesis-driven evolution: accumulated knowledge from past iterations
+        self.knowledge_entries: list = []  # [(hypothesis, outcome, score_delta, iteration)]
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
 
@@ -389,6 +427,7 @@ class ProcessParallelController:
             "random_seed": config.random_seed,
             "diff_based_evolution": config.diff_based_evolution,
             "max_code_length": config.max_code_length,
+            "hypothesis_driven": config.hypothesis_driven,
             "language": config.language,
             "file_suffix": self.file_suffix,
         }
@@ -466,6 +505,10 @@ class ProcessParallelController:
             artifacts = self.database.get_artifacts(pid)
             if artifacts:
                 snapshot["artifacts"][pid] = artifacts
+
+        # Include recent knowledge entries for hypothesis-driven evolution
+        if self.config.hypothesis_driven:
+            snapshot["knowledge_entries"] = self.knowledge_entries[-20:]
 
         return snapshot
 
@@ -743,6 +786,57 @@ class ProcessParallelController:
                                     )
                                     self.early_stopping_triggered = True
                                     break
+
+                # Record hypothesis outcome for knowledge accumulation
+                if hasattr(result, "hypothesis") and result.hypothesis:
+                    if result.error:
+                        h_outcome = "ERROR"
+                        h_delta = 0.0
+                    elif result.child_program_dict:
+                        child_score = result.child_program_dict.get(
+                            "metrics", {}
+                        ).get("combined_score", 0)
+                        parent = self.database.programs.get(result.parent_id)
+                        parent_score = (
+                            parent.metrics.get("combined_score", 0) if parent else 0
+                        )
+                        h_delta = child_score - parent_score
+                        if h_delta > 0.001:
+                            h_outcome = "CONFIRMED"
+                        else:
+                            # Include the specific error reason if the evaluator reported one
+                            metrics_error = result.child_program_dict.get(
+                                "metrics", {}
+                            ).get("error", "")
+                            if metrics_error:
+                                h_outcome = f"REFUTED ({metrics_error})"
+                            else:
+                                h_outcome = "REFUTED"
+                    else:
+                        h_outcome = "REFUTED"
+                        h_delta = 0.0
+                    self.knowledge_entries.append(
+                        (result.hypothesis, h_outcome, h_delta, completed_iteration)
+                    )
+                elif self.config.hypothesis_driven and not (
+                    hasattr(result, "hypothesis") and result.hypothesis
+                ):
+                    # No hypothesis extracted -- record errors so the LLM sees them
+                    if result.child_program_dict:
+                        metrics_error = result.child_program_dict.get(
+                            "metrics", {}
+                        ).get("error", "")
+                        if metrics_error:
+                            self.knowledge_entries.append(
+                                (f"[Evaluation failed: {metrics_error}]", "ERROR", 0.0, completed_iteration)
+                            )
+                    elif result.error:
+                        error_msg = result.error
+                        if "timeout" in error_msg.lower():
+                            error_msg = "Program timed out -- too many optimization iterations"
+                        self.knowledge_entries.append(
+                            (f"[Error: {error_msg}]", "ERROR", 0.0, completed_iteration)
+                        )
 
             except FutureTimeoutError:
                 logger.error(

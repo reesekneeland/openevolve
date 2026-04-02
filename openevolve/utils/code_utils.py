@@ -120,6 +120,22 @@ def parse_full_rewrite(llm_response: str, language: str = "python") -> Optional[
     return llm_response
 
 
+def extract_hypothesis(llm_response: str) -> Optional[str]:
+    """Extract hypothesis text from a structured LLM response.
+
+    Matches both plain "Hypothesis:" and bold "**Hypothesis:**" markers,
+    grabbing text until the next double-newline or code fence.
+    """
+    match = re.search(
+        r"(?:\*\*)?Hypothesis:(?:\*\*)?\s*(.+?)(?=\n\n|\n```|$)",
+        llm_response,
+        re.DOTALL,
+    )
+    if match:
+        return match.group(1).strip()
+    return None
+
+
 def _format_block_lines(lines: List[str], max_line_len: int = 100, max_lines: int = 30) -> str:
     """Format a block of lines for diff summary: show all lines (truncated per line, optional cap)."""
     truncated = []
