@@ -35,6 +35,7 @@ class SerializableResult:
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
     hypothesis: Optional[str] = None  # Extracted hypothesis from LLM response
+    token_usage: Optional[Dict[str, int]] = None  # Token counts from LLM call
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -231,6 +232,13 @@ def _run_iteration_worker(
             logger.error(f"LLM generation failed: {e}")
             return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
 
+        # Capture token usage from the LLM that was just called
+        token_usage = None
+        for m in _worker_llm_ensemble.models:
+            if hasattr(m, "last_usage") and m.last_usage is not None:
+                token_usage = m.last_usage
+                break
+
         # Check for None response
         if llm_response is None:
             return SerializableResult(error="LLM returned None response", iteration=iteration)
@@ -360,6 +368,7 @@ def _run_iteration_worker(
             iteration=iteration,
             target_island=target_island,
             hypothesis=hypothesis_text,
+            token_usage=token_usage,
         )
 
     except Exception as e:

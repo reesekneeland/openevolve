@@ -89,6 +89,9 @@ class OpenAILLM(LLMInterface):
                 max_retries=max_retries,
             )
 
+        # Token usage from the last API call (set by _call_api)
+        self.last_usage: Optional[Dict[str, int]] = None
+
         # Only log unique models to reduce duplication
         if not hasattr(logger, "_initialized_models"):
             logger._initialized_models = set()
@@ -219,8 +222,22 @@ class OpenAILLM(LLMInterface):
         response = await loop.run_in_executor(
             None, lambda: self.client.chat.completions.create(**params)
         )
+        # Capture token usage
+        if response.usage:
+            self.last_usage = {
+                "prompt_tokens": response.usage.prompt_tokens or 0,
+                "completion_tokens": response.usage.completion_tokens or 0,
+                "total_tokens": response.usage.total_tokens or 0,
+            }
+            logger.info(
+                f"Token usage: prompt={self.last_usage['prompt_tokens']}, "
+                f"completion={self.last_usage['completion_tokens']}, "
+                f"total={self.last_usage['total_tokens']}"
+            )
+        else:
+            self.last_usage = None
+
         # Logging of system prompt, user message and response content
-        logger = logging.getLogger(__name__)
         logger.debug(f"API parameters: {params}")
         logger.debug(f"API response: {response.choices[0].message.content}")
         return response.choices[0].message.content
