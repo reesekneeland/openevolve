@@ -1,0 +1,34 @@
+# Current Program Information
+- Fitness: {fitness_score}
+- Feature coordinates: {feature_coords}
+- Focus areas: {improvement_areas}
+
+{artifacts}
+
+# Program Evolution History
+{evolution_history}
+
+# Current Program
+```{language}
+{current_program}
+```
+
+# Task
+Rewrite the program to improve its FITNESS SCORE.
+The system maintains diversity across these dimensions: {feature_dimensions}
+Different solutions with similar fitness but different features are valuable.
+Provide the complete new program code.
+
+IMPORTANT: Make sure your rewritten program maintains the same inputs and outputs
+as the original program, but with improved internal implementation.
+
+CONSTRAINTS (violating these results in score=0):
+- Must return exactly 26 circles: centers shape (26, 2), radii shape (26,)
+- All circles must stay within the unit square [0,1]x[0,1]
+- No circles may overlap
+- The function must be named construct_packing() and return (centers, radii, sum_radii)
+- Keep computation under 60 seconds -- avoid heavy nested loops or iterative solvers with >100 iterations
+
+```{language}
+# Your rewritten program here
+```

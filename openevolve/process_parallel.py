@@ -34,6 +34,10 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
     target_island: Optional[int] = None  # Island where child should be placed
+    hypothesis: Optional[str] = None  # Extracted hypothesis from LLM response
+    token_usage: Optional[Dict[str, int]] = None  # Token counts from LLM call
+    bandit_arm: Optional[str] = None  # Which bandit strategy arm was used
+    reflection: Optional[str] = None  # Post-evaluation reflection on why hypothesis worked/failed
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -148,6 +152,9 @@ def _run_iteration_worker(
         # Get parent artifacts if available
         parent_artifacts = db_snapshot["artifacts"].get(parent_id)
 
+        # Get bandit arm for this iteration (may be None)
+        bandit_arm = db_snapshot.get("bandit_arm")
+
         # Get island-specific programs for context
         parent_island = parent.metadata.get("island", db_snapshot["current_island"])
         island_programs = [
@@ -178,6 +185,90 @@ def _run_iteration_worker(
             parent_changes_desc = None
             child_changes_desc = None
 
+        # Build extra kwargs for hypothesis-driven evolution
+        extra_prompt_kwargs = {}
+        if getattr(_worker_config, "hypothesis_driven", False):
+            all_knowledge = db_snapshot.get("knowledge_entries", {})
+
+            # Primary: this island's full knowledge history
+            island_entries = all_knowledge.get(str(parent_island), [])
+
+            # Secondary: confirmed hypotheses from other islands (cross-pollination)
+            cross_island = []
+            for isl, entries in all_knowledge.items():
+                if int(isl) != parent_island:
+                    cross_island.extend(
+                        e for e in entries if e[1] == "CONFIRMED" and e[2] > 0.01
+                    )
+
+            # Filter noise: remove entries with |delta| < 0.005, keep ERRORs always
+            island_entries = [
+                e for e in island_entries
+                if abs(e[2]) > 0.005 or "ERROR" in str(e[1])
+            ]
+
+            display_entries = island_entries + cross_island
+            island_entry_set = set(tuple(e) for e in island_entries)
+
+            if display_entries:
+                kb_lines = ["# Knowledge Base (Past Hypotheses & Insights)"]
+                for entry in display_entries:
+                    hyp, outcome, delta, it = entry[0], entry[1], entry[2], entry[3]
+                    reflection = entry[4] if len(entry) > 4 else ""
+                    sign = "+" if delta > 0 else ""
+                    source = ""
+                    if tuple(entry) not in island_entry_set:
+                        source = " [other island]"
+                    line = f"- [{outcome} {sign}{delta:.4f}] \"{hyp}\" (iter {it}){source}"
+                    if reflection:
+                        line += f"\n  Insight: {reflection}"
+                    kb_lines.append(line)
+                extra_prompt_kwargs["knowledge_base_summary"] = "\n".join(kb_lines)
+            else:
+                extra_prompt_kwargs["knowledge_base_summary"] = ""
+
+        # Population summary (HDE v2)
+        if getattr(_worker_config, "hypothesis_driven", False):
+            extra_prompt_kwargs["population_summary"] = db_snapshot.get(
+                "population_summary", ""
+            )
+
+        # Score decomposition breakdown for parent program (HDE v2)
+        if getattr(_worker_config, "hypothesis_driven", False) and parent.metrics:
+            sub_keys = [
+                "boundary_utilization", "interior_density",
+                "worst_gap_size", "mean_radius", "radius_cv",
+            ]
+            sub_lines = []
+            for k in sub_keys:
+                v = parent.metrics.get(k)
+                if v is not None:
+                    label = k.replace("_", " ").title()
+                    sub_lines.append(f"  {label}: {v:.4f}")
+            extra_prompt_kwargs["score_breakdown"] = "\n".join(sub_lines) if sub_lines else ""
+
+        # Bandit strategy instruction (HDE v2)
+        bandit_arm = db_snapshot.get("bandit_arm")
+        STRATEGY_INSTRUCTIONS = {
+            "explore": "Try a FUNDAMENTALLY DIFFERENT algorithmic approach from the current program. Do not refine -- reinvent.",
+            "refine": "Make TARGETED improvements to the current program. Keep the overall structure but optimize parameters, tighten loops, or improve numerical precision.",
+            "combine": "Look at the inspiration programs and COMBINE the strongest elements from different approaches into one program.",
+            "diagnose": "The current program has specific weaknesses shown in the score breakdown. DIAGNOSE the bottleneck and fix it.",
+            "target": "Focus on improving the WEAKEST sub-metric shown in the score breakdown. Ignore other aspects.",
+        }
+        if bandit_arm and bandit_arm in STRATEGY_INSTRUCTIONS:
+            extra_prompt_kwargs["strategy_instruction"] = (
+                f"**Strategy: {bandit_arm.upper()}** -- {STRATEGY_INSTRUCTIONS[bandit_arm]}"
+            )
+        else:
+            extra_prompt_kwargs["strategy_instruction"] = ""
+
+        # Select template override for HDE mode
+        template_key = None
+        if getattr(_worker_config, "hypothesis_driven", False):
+            if not _worker_config.diff_based_evolution:
+                template_key = "full_rewrite_user_hde"
+
         prompt = _worker_prompt_sampler.build_prompt(
             current_program=parent.code,
             parent_program=parent.code,
@@ -188,24 +279,125 @@ def _run_iteration_worker(
             language=_worker_config.language,
             evolution_round=iteration,
             diff_based_evolution=_worker_config.diff_based_evolution,
+            template_key=template_key,
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
             current_changes_description=parent_changes_desc,
+            **extra_prompt_kwargs,
         )
 
         iteration_start = time.time()
 
-        # Generate code modification (sync wrapper for async)
-        try:
-            llm_response = asyncio.run(
-                _worker_llm_ensemble.generate_with_context(
-                    system_message=prompt["system"],
-                    messages=[{"role": "user", "content": prompt["user"]}],
-                )
+        # GAN-style hypothesis critique: two-call flow
+        hypothesis_text = None
+        token_usage = None
+
+        if getattr(_worker_config, "hypothesis_critique", False):
+            from openevolve.utils.code_utils import extract_hypothesis, parse_critique_response
+
+            # Call 1: Generate + self-critique hypothesis (up to 3 attempts)
+            critique_template = _worker_prompt_sampler.template_manager.get_template(
+                "full_rewrite_user_hde_critique"
             )
-        except Exception as e:
-            logger.error(f"LLM generation failed: {e}")
-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+            critique_prompt_text = critique_template.format(
+                fitness_score=f"{parent.metrics.get('combined_score', 0):.4f}",
+                feature_coords="",
+                improvement_areas="Improve fitness score",
+                evolution_history="",
+                current_program=parent.code,
+                language=_worker_config.language,
+                **extra_prompt_kwargs,
+            )
+
+            best_hypothesis = None
+            best_rating = 0
+            critique_attempts = 0
+
+            for attempt in range(3):
+                critique_attempts += 1
+                try:
+                    critique_response = asyncio.run(
+                        _worker_llm_ensemble.generate_with_context(
+                            system_message=prompt["system"],
+                            messages=[{"role": "user", "content": critique_prompt_text}],
+                            max_tokens=300,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Critique call {attempt+1} failed: {e}")
+                    continue
+
+                hyp, rating = parse_critique_response(critique_response or "")
+                logger.info(f"Critique attempt {attempt+1}: rating={rating}, hypothesis={hyp[:80] if hyp else 'None'}")
+
+                if hyp and rating > best_rating:
+                    best_hypothesis = hyp
+                    best_rating = rating
+                if rating >= 3:
+                    break
+
+            if not best_hypothesis:
+                return SerializableResult(
+                    error=f"All {critique_attempts} critique attempts failed to produce a hypothesis",
+                    iteration=iteration,
+                )
+
+            hypothesis_text = best_hypothesis
+            logger.info(f"Vetted hypothesis (rating={best_rating}): {hypothesis_text[:100]}")
+
+            # Call 2: Implement the vetted hypothesis
+            impl_template = _worker_prompt_sampler.template_manager.get_template(
+                "full_rewrite_user_hde_implement"
+            )
+            impl_prompt_text = impl_template.format(
+                fitness_score=f"{parent.metrics.get('combined_score', 0):.4f}",
+                feature_coords="",
+                current_program=parent.code,
+                language=_worker_config.language,
+                feature_dimensions=", ".join(db_snapshot.get("feature_dimensions", [])),
+                vetted_hypothesis=best_hypothesis,
+                artifacts="",
+            )
+
+            try:
+                llm_response = asyncio.run(
+                    _worker_llm_ensemble.generate_with_context(
+                        system_message=prompt["system"],
+                        messages=[{"role": "user", "content": impl_prompt_text}],
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Implementation call failed: {e}")
+                return SerializableResult(
+                    error=f"Implementation call failed: {str(e)}",
+                    iteration=iteration,
+                    hypothesis=hypothesis_text,
+                )
+
+        else:
+            # Standard single-call flow (existing behavior)
+            try:
+                llm_response = asyncio.run(
+                    _worker_llm_ensemble.generate_with_context(
+                        system_message=prompt["system"],
+                        messages=[{"role": "user", "content": prompt["user"]}],
+                    )
+                )
+            except Exception as e:
+                logger.error(f"LLM generation failed: {e}")
+                return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+
+            # Extract hypothesis from structured response (single-call HDE)
+            if getattr(_worker_config, "hypothesis_driven", False):
+                from openevolve.utils.code_utils import extract_hypothesis
+
+                hypothesis_text = extract_hypothesis(llm_response)
+
+        # Capture token usage from the LLM that was just called
+        for m in _worker_llm_ensemble.models:
+            if hasattr(m, "last_usage") and m.last_usage is not None:
+                token_usage = m.last_usage
+                break
 
         # Check for None response
         if llm_response is None:
@@ -272,7 +464,9 @@ def _run_iteration_worker(
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
                 return SerializableResult(
-                    error=f"No valid code found in response", iteration=iteration
+                    error=f"No valid code found in response",
+                    iteration=iteration,
+                    hypothesis=hypothesis_text,
                 )
 
             child_code = new_code
@@ -283,6 +477,7 @@ def _run_iteration_worker(
             return SerializableResult(
                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
                 iteration=iteration,
+                hypothesis=hypothesis_text,
             )
 
         # Evaluate the child program
@@ -316,6 +511,38 @@ def _run_iteration_worker(
         # Get target island from snapshot (where child should be placed)
         target_island = db_snapshot.get("sampling_island")
 
+        # Post-evaluation reflection: ask the LLM why the hypothesis worked or failed
+        reflection_text = None
+        if (
+            getattr(_worker_config, "hypothesis_driven", False)
+            and hypothesis_text
+            and child_metrics.get("combined_score", 0) > 0
+        ):
+            parent_score = parent.metrics.get("combined_score", 0)
+            child_score = child_metrics.get("combined_score", 0)
+            delta = child_score - parent_score
+            outcome = "improved" if delta > 0.001 else "did not improve"
+
+            reflection_prompt = (
+                f"A circle packing program was modified. "
+                f"Hypothesis: \"{hypothesis_text}\"\n"
+                f"Result: score went from {parent_score:.4f} to {child_score:.4f} ({outcome}, delta={delta:+.4f}).\n"
+                f"In one sentence, what principle or lesson does this result teach? "
+                f"Be specific and actionable for future iterations."
+            )
+            try:
+                reflection_text = asyncio.run(
+                    _worker_llm_ensemble.generate_with_context(
+                        system_message="You are a concise scientific advisor. Respond with exactly one sentence.",
+                        messages=[{"role": "user", "content": reflection_prompt}],
+                        max_tokens=100,
+                    )
+                )
+                if reflection_text:
+                    reflection_text = reflection_text.strip().split("\n")[0]
+            except Exception as e:
+                logger.debug(f"Reflection call failed: {e}")
+
         return SerializableResult(
             child_program_dict=child_program.to_dict(),
             parent_id=parent.id,
@@ -325,6 +552,10 @@ def _run_iteration_worker(
             artifacts=artifacts,
             iteration=iteration,
             target_island=target_island,
+            hypothesis=hypothesis_text,
+            token_usage=token_usage,
+            bandit_arm=bandit_arm,
+            reflection=reflection_text,
         )
 
     except Exception as e:
@@ -356,6 +587,16 @@ class ProcessParallelController:
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
         self.num_islands = config.database.num_islands
+
+        # Hypothesis-driven evolution: per-island knowledge from past iterations
+        self.knowledge_entries: dict = {
+            i: [] for i in range(self.num_islands)
+        }  # {island_id: [(hypothesis, outcome, score_delta, iteration)]}
+
+        # Adaptive strategy bandit (UCB1)
+        self.bandit_arms = ["explore", "refine", "combine", "diagnose", "target"]
+        self.bandit_counts = {arm: 0 for arm in self.bandit_arms}
+        self.bandit_rewards = {arm: 0.0 for arm in self.bandit_arms}
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
 
@@ -389,6 +630,9 @@ class ProcessParallelController:
             "random_seed": config.random_seed,
             "diff_based_evolution": config.diff_based_evolution,
             "max_code_length": config.max_code_length,
+            "hypothesis_driven": config.hypothesis_driven,
+            "bandit_enabled": config.bandit_enabled,
+            "hypothesis_critique": config.hypothesis_critique,
             "language": config.language,
             "file_suffix": self.file_suffix,
         }
@@ -439,6 +683,57 @@ class ProcessParallelController:
         logger.info("Graceful shutdown requested...")
         self.shutdown_event.set()
 
+    def _select_bandit_arm(self) -> str:
+        """Select a strategy arm using UCB1."""
+        import math
+
+        total = sum(self.bandit_counts.values())
+
+        # First: try each arm once
+        for arm in self.bandit_arms:
+            if self.bandit_counts[arm] == 0:
+                return arm
+
+        # UCB1 selection
+        best_arm = self.bandit_arms[0]
+        best_ucb = -float("inf")
+        for arm in self.bandit_arms:
+            n = self.bandit_counts[arm]
+            avg_reward = self.bandit_rewards[arm] / n
+            ucb = avg_reward + math.sqrt(2 * math.log(total) / n)
+            if ucb > best_ucb:
+                best_ucb = ucb
+                best_arm = arm
+        return best_arm
+
+    def _update_bandit(self, arm: str, reward: float) -> None:
+        """Update bandit statistics after observing a reward."""
+        self.bandit_counts[arm] += 1
+        self.bandit_rewards[arm] += reward
+
+    def _format_population_summary(self) -> str:
+        """Format island stats into a population landscape summary."""
+        stats = self.database.get_island_stats()
+        total_programs = sum(s.get("num_programs", 0) for s in stats)
+        best_overall = max(
+            (s.get("best_score", 0) for s in stats), default=0
+        )
+
+        lines = [
+            f"# Population Landscape ({total_programs} programs across {len(stats)} islands, best: {best_overall:.4f})"
+        ]
+        for s in stats:
+            idx = s.get("island_id", "?")
+            n = s.get("num_programs", 0)
+            best = s.get("best_score", 0)
+            avg = s.get("avg_score", 0)
+            div = s.get("diversity", 0)
+            marker = " *" if s.get("is_current", False) else ""
+            lines.append(
+                f"  Island {idx}: {n} programs, best={best:.4f}, avg={avg:.4f}, diversity={div:.0f}{marker}"
+            )
+        return "\n".join(lines)
+
     def _create_database_snapshot(self) -> Dict[str, Any]:
         """Create a serializable snapshot of the database state"""
         # Only include necessary data for workers
@@ -466,6 +761,23 @@ class ProcessParallelController:
             artifacts = self.database.get_artifacts(pid)
             if artifacts:
                 snapshot["artifacts"][pid] = artifacts
+
+        # Include per-island knowledge entries for hypothesis-driven evolution
+        if self.config.hypothesis_driven:
+            snapshot["knowledge_entries"] = {
+                str(k): v[-20:] for k, v in self.knowledge_entries.items()
+            }
+
+        # Include population summary for HDE v2
+        if self.config.hypothesis_driven:
+            snapshot["population_summary"] = self._format_population_summary()
+
+        # Include bandit-selected strategy for HDE v2
+        if self.config.bandit_enabled:
+            arm = self._select_bandit_arm()
+            snapshot["bandit_arm"] = arm
+        else:
+            snapshot["bandit_arm"] = None
 
         return snapshot
 
@@ -676,6 +988,25 @@ class ProcessParallelController:
                         self.database.log_island_status()
                         if checkpoint_callback:
                             checkpoint_callback(completed_iteration)
+                        # Log knowledge base state for analysis
+                        if self.config.hypothesis_driven:
+                            total_kb = sum(len(v) for v in self.knowledge_entries.values())
+                            confirmed = sum(
+                                1 for v in self.knowledge_entries.values()
+                                for e in v if e[1] == "CONFIRMED"
+                            )
+                            refuted = sum(
+                                1 for v in self.knowledge_entries.values()
+                                for e in v if "REFUTED" in str(e[1])
+                            )
+                            errors = sum(
+                                1 for v in self.knowledge_entries.values()
+                                for e in v if "ERROR" in str(e[1])
+                            )
+                            logger.info(
+                                f"Knowledge base: {total_kb} entries "
+                                f"({confirmed} confirmed, {refuted} refuted, {errors} errors)"
+                            )
 
                     # Check target score
                     if target_score is not None and child_program.metrics:
@@ -743,6 +1074,73 @@ class ProcessParallelController:
                                     )
                                     self.early_stopping_triggered = True
                                     break
+
+                # Record hypothesis outcome for knowledge accumulation (per-island)
+                h_island = result.target_island if result.target_island is not None else 0
+                if h_island not in self.knowledge_entries:
+                    self.knowledge_entries[h_island] = []
+
+                if hasattr(result, "hypothesis") and result.hypothesis:
+                    if result.error:
+                        h_outcome = "ERROR"
+                        h_delta = 0.0
+                    elif result.child_program_dict:
+                        child_score = result.child_program_dict.get(
+                            "metrics", {}
+                        ).get("combined_score", 0)
+                        parent = self.database.programs.get(result.parent_id)
+                        parent_score = (
+                            parent.metrics.get("combined_score", 0) if parent else 0
+                        )
+                        h_delta = child_score - parent_score
+                        if h_delta > 0.001:
+                            h_outcome = "CONFIRMED"
+                        else:
+                            metrics_error = result.child_program_dict.get(
+                                "metrics", {}
+                            ).get("error", "")
+                            if metrics_error:
+                                h_outcome = f"REFUTED ({metrics_error})"
+                            else:
+                                h_outcome = "REFUTED"
+                    else:
+                        h_outcome = "REFUTED"
+                        h_delta = 0.0
+                    reflection = getattr(result, "reflection", None) or ""
+                    self.knowledge_entries[h_island].append(
+                        (result.hypothesis, h_outcome, h_delta, completed_iteration, reflection)
+                    )
+                elif self.config.hypothesis_driven and not (
+                    hasattr(result, "hypothesis") and result.hypothesis
+                ):
+                    if result.child_program_dict:
+                        metrics_error = result.child_program_dict.get(
+                            "metrics", {}
+                        ).get("error", "")
+                        if metrics_error:
+                            self.knowledge_entries[h_island].append(
+                                (f"[Evaluation failed: {metrics_error}]", "ERROR", 0.0, completed_iteration, "")
+                            )
+                    elif result.error:
+                        error_msg = result.error
+                        if "timeout" in error_msg.lower():
+                            error_msg = "Program timed out -- too many optimization iterations"
+                        self.knowledge_entries[h_island].append(
+                            (f"[Error: {error_msg}]", "ERROR", 0.0, completed_iteration, "")
+                        )
+
+                # Update bandit with reward from this iteration
+                if self.config.bandit_enabled and hasattr(result, "bandit_arm") and result.bandit_arm:
+                    if result.error:
+                        reward = -0.1  # Small penalty for errors
+                    elif result.child_program_dict:
+                        child_score = result.child_program_dict.get("metrics", {}).get("combined_score", 0)
+                        parent_prog = self.database.programs.get(result.parent_id)
+                        parent_score = parent_prog.metrics.get("combined_score", 0) if parent_prog else 0
+                        reward = max(child_score - parent_score, 0.0)  # Only positive rewards
+                    else:
+                        reward = 0.0
+                    self._update_bandit(result.bandit_arm, reward)
 
             except FutureTimeoutError:
                 logger.error(

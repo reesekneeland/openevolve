@@ -183,6 +183,67 @@ except Exception as e:
             os.unlink(results_path)
 
 
+def compute_sub_metrics(centers, radii):
+    """Compute diagnostic sub-metrics for a valid circle packing.
+
+    Returns dict with:
+        boundary_utilization: how well circles use the boundary (0-1, higher=better)
+        interior_density: how packed the interior is (0-1, higher=better)
+        worst_gap_size: radius of largest circle that could fit in empty space
+        mean_radius: average circle radius
+        radius_cv: coefficient of variation of radii (0=uniform, higher=varied)
+    """
+    n = len(radii)
+
+    # Boundary utilization: for each circle, how close is its edge to the
+    # nearest wall relative to its radius?  A circle touching a wall has
+    # edge_dist=0.  We want circles *near* walls, so utilization is high
+    # when boundary circles are large and close to edges.
+    edge_dists = np.minimum(
+        np.minimum(centers[:, 0], 1 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1 - centers[:, 1]),
+    )
+    # Circles whose center is within 0.25 of a wall are "boundary circles"
+    boundary_mask = edge_dists < 0.25
+    if boundary_mask.any():
+        # For boundary circles: ratio of radius to available space toward wall
+        boundary_util = float(np.mean(radii[boundary_mask] / (edge_dists[boundary_mask] + 1e-9)))
+        boundary_util = min(boundary_util, 1.0)
+    else:
+        boundary_util = 0.0
+
+    # Interior density: sample a grid of points, check what fraction are
+    # covered by circles.  Quick Monte-Carlo on a 50x50 grid.
+    gx = np.linspace(0.01, 0.99, 50)
+    gy = np.linspace(0.01, 0.99, 50)
+    grid = np.array(np.meshgrid(gx, gy)).T.reshape(-1, 2)  # (2500, 2)
+    dists = np.linalg.norm(grid[:, None, :] - centers[None, :, :], axis=2)  # (2500, n)
+    covered = np.any(dists < radii[None, :], axis=1)
+    interior_density = float(np.mean(covered))
+
+    # Worst gap: for each uncovered grid point, find the max radius circle
+    # that could fit there (limited by walls and existing circles).
+    uncovered_pts = grid[~covered]
+    worst_gap = 0.0
+    if len(uncovered_pts) > 0:
+        for pt in uncovered_pts[:200]:  # cap iterations
+            max_r = min(pt[0], pt[1], 1 - pt[0], 1 - pt[1])
+            d_to_circles = np.linalg.norm(pt - centers, axis=1) - radii
+            max_r = min(max_r, float(np.min(d_to_circles)))
+            worst_gap = max(worst_gap, max(max_r, 0.0))
+
+    mean_radius = float(np.mean(radii))
+    radius_cv = float(np.std(radii) / mean_radius) if mean_radius > 0 else 0.0
+
+    return {
+        "boundary_utilization": round(boundary_util, 4),
+        "interior_density": round(interior_density, 4),
+        "worst_gap_size": round(worst_gap, 4),
+        "mean_radius": round(mean_radius, 4),
+        "radius_cv": round(radius_cv, 4),
+    }
+
+
 def evaluate(program_path):
     """
     Evaluate the program by running it once and checking the sum of radii
@@ -253,17 +314,22 @@ def evaluate(program_path):
         # Combined score - higher is better
         combined_score = target_ratio * validity
 
+        # Compute diagnostic sub-metrics for valid solutions
+        sub_metrics = compute_sub_metrics(centers, radii) if valid else {}
+
         print(
             f"Evaluation: valid={valid}, sum_radii={sum_radii:.6f}, target={TARGET_VALUE}, ratio={target_ratio:.6f}, time={eval_time:.2f}s"
         )
 
-        return {
+        result = {
             "sum_radii": float(sum_radii),
             "target_ratio": float(target_ratio),
             "validity": float(validity),
             "eval_time": float(eval_time),
             "combined_score": float(combined_score),
         }
+        result.update(sub_metrics)
+        return result
 
     except Exception as e:
         print(f"Evaluation failed completely: {str(e)}")

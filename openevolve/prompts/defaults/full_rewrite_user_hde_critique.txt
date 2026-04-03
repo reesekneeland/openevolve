@@ -1,0 +1,37 @@
+# Current Program Information
+- Fitness: {fitness_score}
+- Feature coordinates: {feature_coords}
+- Focus areas: {improvement_areas}
+
+{knowledge_base_summary}
+
+# Program Evolution History
+{evolution_history}
+
+# Current Program
+```{language}
+{current_program}
+```
+
+# Task
+You are a scientist proposing a hypothesis to improve this program's fitness score.
+
+1. Propose a specific, testable hypothesis about what change will improve the score.
+2. Rate your hypothesis 1-5 on likelihood of success, considering:
+   - Does it address the actual bottleneck in the current program?
+   - Has a similar approach been tried and failed (check knowledge base)?
+   - Is it implementable without violating the constraints below?
+   - Will it produce a valid program with exactly 26 circles?
+3. If your rating is below 3, discard it and propose a DIFFERENT hypothesis.
+
+CONSTRAINTS (the implementation must satisfy these):
+- Must return exactly 26 circles: centers shape (26, 2), radii shape (26,)
+- All circles must stay within the unit square [0,1]x[0,1]
+- No circles may overlap
+- Must include construct_packing() and run_packing() functions
+- Do not use unicode characters in code
+
+Output format (exactly these lines, nothing else):
+Hypothesis: [your specific hypothesis]
+Rating: [1-5]
+Reasoning: [one sentence explaining your rating]
