@@ -37,6 +37,7 @@ class SerializableResult:
     hypothesis: Optional[str] = None  # Extracted hypothesis from LLM response
     token_usage: Optional[Dict[str, int]] = None  # Token counts from LLM call
     bandit_arm: Optional[str] = None  # Which bandit strategy arm was used
+    reflection: Optional[str] = None  # Post-evaluation reflection on why hypothesis worked/failed
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -210,15 +211,18 @@ def _run_iteration_worker(
             island_entry_set = set(tuple(e) for e in island_entries)
 
             if display_entries:
-                kb_lines = ["# Knowledge Base (Past Hypotheses)"]
-                for hyp, outcome, delta, it in display_entries:
+                kb_lines = ["# Knowledge Base (Past Hypotheses & Insights)"]
+                for entry in display_entries:
+                    hyp, outcome, delta, it = entry[0], entry[1], entry[2], entry[3]
+                    reflection = entry[4] if len(entry) > 4 else ""
                     sign = "+" if delta > 0 else ""
                     source = ""
-                    if tuple([hyp, outcome, delta, it]) not in island_entry_set:
+                    if tuple(entry) not in island_entry_set:
                         source = " [other island]"
-                    kb_lines.append(
-                        f"- [{outcome} {sign}{delta:.4f}] \"{hyp}\" (iter {it}){source}"
-                    )
+                    line = f"- [{outcome} {sign}{delta:.4f}] \"{hyp}\" (iter {it}){source}"
+                    if reflection:
+                        line += f"\n  Insight: {reflection}"
+                    kb_lines.append(line)
                 extra_prompt_kwargs["knowledge_base_summary"] = "\n".join(kb_lines)
             else:
                 extra_prompt_kwargs["knowledge_base_summary"] = ""
@@ -422,6 +426,38 @@ def _run_iteration_worker(
         # Get target island from snapshot (where child should be placed)
         target_island = db_snapshot.get("sampling_island")
 
+        # Post-evaluation reflection: ask the LLM why the hypothesis worked or failed
+        reflection_text = None
+        if (
+            getattr(_worker_config, "hypothesis_driven", False)
+            and hypothesis_text
+            and child_metrics.get("combined_score", 0) > 0
+        ):
+            parent_score = parent.metrics.get("combined_score", 0)
+            child_score = child_metrics.get("combined_score", 0)
+            delta = child_score - parent_score
+            outcome = "improved" if delta > 0.001 else "did not improve"
+
+            reflection_prompt = (
+                f"A circle packing program was modified. "
+                f"Hypothesis: \"{hypothesis_text}\"\n"
+                f"Result: score went from {parent_score:.4f} to {child_score:.4f} ({outcome}, delta={delta:+.4f}).\n"
+                f"In one sentence, what principle or lesson does this result teach? "
+                f"Be specific and actionable for future iterations."
+            )
+            try:
+                reflection_text = asyncio.run(
+                    _worker_llm_ensemble.generate_with_context(
+                        system_message="You are a concise scientific advisor. Respond with exactly one sentence.",
+                        messages=[{"role": "user", "content": reflection_prompt}],
+                        max_tokens=100,
+                    )
+                )
+                if reflection_text:
+                    reflection_text = reflection_text.strip().split("\n")[0]
+            except Exception as e:
+                logger.debug(f"Reflection call failed: {e}")
+
         return SerializableResult(
             child_program_dict=child_program.to_dict(),
             parent_id=parent.id,
@@ -434,6 +470,7 @@ def _run_iteration_worker(
             hypothesis=hypothesis_text,
             token_usage=token_usage,
             bandit_arm=bandit_arm,
+            reflection=reflection_text,
         )
 
     except Exception as e:
@@ -983,8 +1020,9 @@ class ProcessParallelController:
                     else:
                         h_outcome = "REFUTED"
                         h_delta = 0.0
+                    reflection = getattr(result, "reflection", None) or ""
                     self.knowledge_entries[h_island].append(
-                        (result.hypothesis, h_outcome, h_delta, completed_iteration)
+                        (result.hypothesis, h_outcome, h_delta, completed_iteration, reflection)
                     )
                 elif self.config.hypothesis_driven and not (
                     hasattr(result, "hypothesis") and result.hypothesis
@@ -995,14 +1033,14 @@ class ProcessParallelController:
                         ).get("error", "")
                         if metrics_error:
                             self.knowledge_entries[h_island].append(
-                                (f"[Evaluation failed: {metrics_error}]", "ERROR", 0.0, completed_iteration)
+                                (f"[Evaluation failed: {metrics_error}]", "ERROR", 0.0, completed_iteration, "")
                             )
                     elif result.error:
                         error_msg = result.error
                         if "timeout" in error_msg.lower():
                             error_msg = "Program timed out -- too many optimization iterations"
                         self.knowledge_entries[h_island].append(
-                            (f"[Error: {error_msg}]", "ERROR", 0.0, completed_iteration)
+                            (f"[Error: {error_msg}]", "ERROR", 0.0, completed_iteration, "")
                         )
 
                 # Update bandit with reward from this iteration
