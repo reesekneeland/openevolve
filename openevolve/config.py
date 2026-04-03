@@ -422,6 +422,7 @@ class Config:
     max_code_length: int = 10000
     hypothesis_driven: bool = False  # Enable hypothesis-driven evolution (HDE)
     bandit_enabled: bool = False  # Enable adaptive strategy bandit for HDE v2
+    hypothesis_critique: bool = False  # Enable GAN-style self-critique before implementation
     diff_pattern: str = r"<<<<<<< SEARCH\n(.*?)=======\n(.*?)>>>>>>> REPLACE"
 
     # Early stopping settings
